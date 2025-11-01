@@ -1,22 +1,12 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Events; // <-- for UnityEvents
+using UnityEngine.Events;
 
 [RequireComponent(typeof(Animator))]
-[DefaultExecutionOrder(10000)] // very late; also set Script Execution Order in Project Settings if needed
+[DefaultExecutionOrder(10000)]
 public class LookAtCrowd : MonoBehaviour
 {
-    // =========================
-    // Existing settings (kept)
-    // =========================
-
-    public float minLook = 0.8f;
-    public float maxLook = 2.0f;
-    public float minCooldown = 1.5f;
-    public float maxCooldown = 4.0f;
-    public float tickInterval = 3.0f;
-
     [Header("Manual Override")]
     public bool forceLook = false;
 
@@ -46,11 +36,13 @@ public class LookAtCrowd : MonoBehaviour
     [Tooltip("Blend of our end-of-frame correction (0 = off, 1 = full).")]
     public float endOfFrameBlend = 1f;
 
-    Coroutine _scheduledStopCo;
+    [Header("Idle / Cooldown Timings")]
+    [Tooltip("Randomized idle delay applied on enable so crowds desync a bit.")]
+    public Vector2 initialIdleDelayRange = new Vector2(0.3f, 1.2f);
+    [Tooltip("Cooldown window when we choose to remain idle.")]
+    public Vector2 idleCooldownRange = new Vector2(0.6f, 1.4f);
 
-    // =========================================
-    // Condition & player/peer time targets
-    // =========================================
+    Coroutine _scheduledStopCo;
 
     public enum ConditionType { Negative, Positive }
 
@@ -67,10 +59,6 @@ public class LookAtCrowd : MonoBehaviour
     [Header("Convergence (EMA for realized shares)")]
     [Tooltip("Higher = faster adaptation to recent behavior.")]
     [Range(0.0f, 1.0f)] public float shareEmaAlpha = 0.15f;
-
-    // ================================
-    // Peer (agent) look settings
-    // ================================
 
     [Header("Peer (Agent) Look Settings")]
     [Tooltip("Tag of other characters to consider as peer gaze targets.")]
@@ -92,15 +80,11 @@ public class LookAtCrowd : MonoBehaviour
     [Tooltip("Cooldown after a PEER look (seconds, random in range).")]
     public Vector2 peerCooldownRange = new Vector2(0.7f, 1.7f);
 
-    [Tooltip("Probability of starting a gaze at all when we tick. If false, we idle until next tick.")]
+    [Tooltip("Probability of starting a gaze when we exit idle cooldown.")]
     [Range(0f, 1f)] public float startGazeProbability = 0.8f;
 
-    [Tooltip("Chance to go idle even if we decide to gaze (adds variability).")]
+    [Tooltip("Additional noise that lowers the effective start chance.")]
     [Range(0f, 1f)] public float idleNoiseChance = 0.1f;
-
-    // ===================================
-    // Eye-contact reaction setup (NEW)
-    // ===================================
 
     [Header("Eye Contact Reactions")]
     [Tooltip("Minimum seconds between two eye-contact reactions (anti-spam).")]
@@ -121,40 +105,28 @@ public class LookAtCrowd : MonoBehaviour
     public UnityEvent OnEyeContactNegativeConstant;
     public UnityEvent OnEyeContactNegativeExtra;
 
-    // ============
-    // Internals
-    // ============
-
     Animator _anim;
     Transform _head;
 
-    Transform _playerEye;   // resolved eye center
-    Transform _fallbackCam; // Camera.main if needed
+    Transform _playerEye;
+    Transform _fallbackCam;
 
-    // Peer heads cache
     readonly List<Transform> _peerHeads = new List<Transform>();
     float _lastPeerScanTime = -999f;
 
-    // Scheduler state
     enum GazePhase { Idle, Player, Peer }
     GazePhase _phase = GazePhase.Idle;
 
-    // Phase timing (for easing/UI)
-    float _phaseTime = 0f;  // 0.._phaseDur
+    float _phaseTime = 0f;
     float _phaseDur = 0f;
+    float _phaseStartTime = 0f;
+    float _phaseEndsAt = 0f;
+    float _cooldownEndsAt = 0f;
 
-    // Absolute guard timestamps
-    float _phaseEndsAt = 0f;       // when current look phase ends
-    float _cooldownEndsAt = 0f;    // when idle cooldown ends
-
-    // eye-contact reaction cooldown
     float _lastEyeContactTime = -999f;
 
-    // rolling realized share (EMA)
-    float _emaPlayerTime = 0f;
-    float _emaTotalLookTime = 1e-5f;
+    float _emaPlayerShare = 0.5f;
 
-    // desired share for current condition
     float TargetPlayerShare
     {
         get
@@ -168,20 +140,16 @@ public class LookAtCrowd : MonoBehaviour
         }
     }
 
-    // per-frame aim/ik (kept from your original)
     Vector3 _aim;
     Vector3 _ikPos;
     float _ikW;
     bool _applyIK;
-    Coroutine _loopCo;
     Coroutine _eofCo;
 
-    // cached desired for end-of-frame / external application
     bool _haveDesiredWorldDir;
     Vector3 _desiredWorldDir;
     float _desiredWeight;
 
-    // the actual target transform selected for this phase
     Transform _currentTarget;
 
     void Awake()
@@ -193,44 +161,52 @@ public class LookAtCrowd : MonoBehaviour
         TryAssignFallbackCamera();
 
         if (!conditionOverride)
+        {
             TryReadConditionFromControllers();
+        }
+
+        _emaPlayerShare = Mathf.Clamp01(TargetPlayerShare);
     }
 
     void Start()
     {
-        // Start in Idle with a brief randomized cooldown-style delay so crowds desync a bit
         _phase = GazePhase.Idle;
         _phaseTime = 0f;
         _phaseDur = 0f;
+        _phaseStartTime = 0f;
         _phaseEndsAt = 0f;
-        _cooldownEndsAt = Time.time + Random.Range(0.3f, 1.2f);
+        _cooldownEndsAt = Time.time + RandomRange(initialIdleDelayRange);
+        ResetIKState();
     }
 
     void OnEnable()
     {
-        if (_loopCo == null) _loopCo = StartCoroutine(LookLoop());
         if (_eofCo == null) _eofCo = StartCoroutine(EndOfFrameApplier());
     }
 
     void OnDisable()
     {
-        if (_loopCo != null) { StopCoroutine(_loopCo); _loopCo = null; }
-        if (_eofCo != null) { StopCoroutine(_eofCo); _eofCo = null; }
-        _applyIK = false;
-        _ikW = 0f;
-        _haveDesiredWorldDir = false;
+        if (_eofCo != null)
+        {
+            StopCoroutine(_eofCo);
+            _eofCo = null;
+        }
+
+        if (_scheduledStopCo != null)
+        {
+            StopCoroutine(_scheduledStopCo);
+            _scheduledStopCo = null;
+        }
+
+        ResetIKState();
         _currentTarget = null;
     }
 
-    // --------------------
-    // Condition resolution
-    // --------------------
     void TryReadConditionFromControllers()
     {
         var go = GameObject.Find("Controllers");
         if (!go) return;
 
-        // Expecting a component "InstructorFadeController" with a public string "condition"
         var ifc = go.GetComponent("InstructorFadeController");
         if (ifc == null) return;
 
@@ -239,7 +215,9 @@ public class LookAtCrowd : MonoBehaviour
         string cond = null;
 
         if (field != null)
+        {
             cond = field.GetValue(ifc) as string;
+        }
         else
         {
             var prop = t.GetProperty("condition");
@@ -256,9 +234,6 @@ public class LookAtCrowd : MonoBehaviour
         }
     }
 
-    // ----------------------
-    // Player target resolving
-    // ----------------------
     void TryAssignFallbackCamera()
     {
         _fallbackCam = Camera.main ? Camera.main.transform : null;
@@ -292,9 +267,6 @@ public class LookAtCrowd : MonoBehaviour
         return null;
     }
 
-    // -------------------------
-    // Peer target (agent heads)
-    // -------------------------
     void ScanPeerHeadsIfNeeded()
     {
         if (Time.time - _lastPeerScanTime < peerScanInterval) return;
@@ -304,7 +276,7 @@ public class LookAtCrowd : MonoBehaviour
         var agents = GameObject.FindGameObjectsWithTag(agentTag);
         foreach (var a in agents)
         {
-            if (a == this.gameObject) continue; // skip self
+            if (a == gameObject) continue;
             var an = a.GetComponent<Animator>();
             if (an != null && an.isHuman)
             {
@@ -313,7 +285,9 @@ public class LookAtCrowd : MonoBehaviour
                 {
                     float d2 = (h.position - transform.position).sqrMagnitude;
                     if (d2 <= peerDetectRadius * peerDetectRadius)
+                    {
                         _peerHeads.Add(h);
+                    }
                 }
             }
         }
@@ -324,7 +298,6 @@ public class LookAtCrowd : MonoBehaviour
         ScanPeerHeadsIfNeeded();
         if (_peerHeads.Count == 0) return null;
 
-        // Pick the closest valid within view cone
         Transform best = null;
         float bestD2 = float.MaxValue;
         for (int i = 0; i < _peerHeads.Count; i++)
@@ -343,160 +316,187 @@ public class LookAtCrowd : MonoBehaviour
         return best;
     }
 
-    // ================================
-    // Gaze scheduler (phases & shares)
-    // ================================
-    IEnumerator LookLoop()
+    void Update()
     {
-        var wait = new WaitForSeconds(tickInterval);
+        if (_playerEye == null) TryAssignPlayerEye();
+        if (_fallbackCam == null) TryAssignFallbackCamera();
 
-        while (true)
+        if (forceLook)
         {
-            if (forceLook)
+            EnsureForceLook();
+        }
+        else
+        {
+            RunScheduler();
+            if (_phase == GazePhase.Player && float.IsPositiveInfinity(_phaseDur))
             {
-                if (_playerEye == null) TryAssignPlayerEye();
-                if (_fallbackCam == null) TryAssignFallbackCamera();
-
-                Transform t = null;
-                if (IsPlayerAvailable()) t = _playerEye;
-                else if (_fallbackCam) t = _fallbackCam;
-
-                _phase = (t != null) ? GazePhase.Player : GazePhase.Idle;
-                _currentTarget = t;
-                _phaseDur = Mathf.Max(0.5f, playerLookDurationRange.x);
-                _phaseTime = 0f;
-                _phaseEndsAt = Time.time + _phaseDur;
-
-                yield return wait;
-                continue;
+                float duration = RandomRange(playerLookDurationRange);
+                _phaseStartTime = Time.time;
+                _phaseDur = duration;
+                _phaseEndsAt = _phaseStartTime + _phaseDur;
             }
+        }
 
-            // Refresh player fallback if needed
-            if (_playerEye == null) TryAssignPlayerEye();
-            if (_fallbackCam == null) TryAssignFallbackCamera();
-
-            if (_phase == GazePhase.Idle)
-            {
-                // Enforce cooldown gate
-                if (Time.time >= _cooldownEndsAt)
-                {
-                    // Try to start a new phase
-                    PickNextPhase();
-
-                    // If we remained Idle, add a small dwell to avoid thrash
-                    if (_phase == GazePhase.Idle)
-                    {
-                        _cooldownEndsAt = Time.time + Random.Range(minCooldown, maxCooldown) * 0.5f;
-                    }
-                }
-            }
-            else
-            {
-                // Enforce look end by absolute time or invalid target
-                bool expired = Time.time >= _phaseEndsAt;
-                bool invalid = !IsCurrentTargetValid();
-
-                if (expired || invalid)
-                {
-                    float cooldown = 0f;
-                    if (_phase == GazePhase.Player)
-                        cooldown = Random.Range(playerCooldownRange.x, playerCooldownRange.y);
-                    else if (_phase == GazePhase.Peer)
-                        cooldown = Random.Range(peerCooldownRange.x, peerCooldownRange.y);
-                    else
-                        cooldown = Random.Range(minCooldown, maxCooldown);
-
-                    // Enter Idle + cooldown window
-                    _phase = GazePhase.Idle;
-                    _currentTarget = null;
-                    _phaseTime = 0f;
-                    _phaseDur = 0f;
-                    _phaseEndsAt = 0f;
-                    _cooldownEndsAt = Time.time + Mathf.Max(0f, cooldown);
-                }
-                else
-                {
-                    // Update EMA shares while the phase is ongoing
-                    float dt = Mathf.Min(tickInterval, Mathf.Max(0f, _phaseEndsAt - Time.time));
-                    if (dt > 0f)
-                    {
-                        float alpha = Mathf.Clamp01(shareEmaAlpha);
-                        _emaTotalLookTime = (1f - alpha) * _emaTotalLookTime + alpha * (dt + 1e-5f);
-                        if (_phase == GazePhase.Player)
-                            _emaPlayerTime = (1f - alpha) * _emaPlayerTime + alpha * dt;
-                    }
-                }
-            }
-
-            yield return wait;
+        if (_phase == GazePhase.Player || _phase == GazePhase.Peer)
+        {
+            UpdateShareEMA(Time.deltaTime);
         }
     }
 
-    void PickNextPhase()
+    void RunScheduler()
     {
-        // Random chance to idle anyway
-        if (Random.value < idleNoiseChance || Random.value > startGazeProbability)
+        if (_phase == GazePhase.Idle)
         {
-            _phase = GazePhase.Idle;
-            _currentTarget = null;
-            _phaseDur = 0f;
-            _phaseTime = 0f;
-            _phaseEndsAt = 0f;
+            if (Time.time >= _cooldownEndsAt)
+            {
+                TryStartNextPhase();
+            }
             return;
         }
 
-        float realizedShare = Mathf.Clamp01(_emaPlayerTime / Mathf.Max(1e-5f, _emaTotalLookTime));
-        float targetShare = Mathf.Clamp01(TargetPlayerShare);
-        float deficit = targetShare - realizedShare;
+        bool invalid = !IsCurrentTargetValid();
+        bool expired = !float.IsPositiveInfinity(_phaseEndsAt) && Time.time >= _phaseEndsAt;
+        if (invalid || expired)
+        {
+            Vector2 cooldownRange = _phase == GazePhase.Player ? playerCooldownRange : peerCooldownRange;
+            EnterIdleWithCooldown(RandomRange(cooldownRange));
+        }
+    }
+
+    void TryStartNextPhase()
+    {
+        float finalStartChance = Mathf.Clamp01(startGazeProbability * (1f - idleNoiseChance));
+        if (finalStartChance <= 0f || Random.value > finalStartChance)
+        {
+            EnterIdleWithCooldown(RandomRange(idleCooldownRange));
+            return;
+        }
 
         bool playerAvailable = IsPlayerAvailable();
+        float targetShare = Mathf.Clamp01(TargetPlayerShare);
+        float realizedShare = Mathf.Clamp01(_emaPlayerShare);
+        float deficit = targetShare - realizedShare;
+
         if (playerAvailable && deficit > 0f)
         {
-            _phase = GazePhase.Player;
-            _currentTarget = _playerEye != null ? _playerEye : _fallbackCam;
-            _phaseDur = Random.Range(playerLookDurationRange.x, playerLookDurationRange.y);
-            _phaseTime = 0f;
-            _phaseEndsAt = Time.time + _phaseDur;
+            StartPlayerLook(RandomRange(playerLookDurationRange));
             return;
         }
 
         if (playerAvailable && Random.value < Mathf.Max(0.1f, targetShare * 0.3f))
         {
-            _phase = GazePhase.Player;
-            _currentTarget = _playerEye != null ? _playerEye : _fallbackCam;
-            _phaseDur = Random.Range(playerLookDurationRange.x, playerLookDurationRange.y);
-            _phaseTime = 0f;
-            _phaseEndsAt = Time.time + _phaseDur;
+            StartPlayerLook(RandomRange(playerLookDurationRange));
             return;
         }
 
         var peer = ChoosePeerTarget();
         if (peer != null)
         {
-            _phase = GazePhase.Peer;
-            _currentTarget = peer;
-            _phaseDur = Random.Range(peerLookDurationRange.x, peerLookDurationRange.y);
-            _phaseTime = 0f;
-            _phaseEndsAt = Time.time + _phaseDur;
+            StartPeerLook(peer, RandomRange(peerLookDurationRange));
             return;
         }
 
         if (playerAvailable)
         {
-            _phase = GazePhase.Player;
-            _currentTarget = _playerEye != null ? _playerEye : _fallbackCam;
-            _phaseDur = Random.Range(playerLookDurationRange.x, playerLookDurationRange.y);
-            _phaseTime = 0f;
-            _phaseEndsAt = Time.time + _phaseDur;
+            StartPlayerLook(RandomRange(playerLookDurationRange));
         }
         else
         {
-            _phase = GazePhase.Idle;
-            _currentTarget = null;
-            _phaseDur = 0f;
-            _phaseTime = 0f;
-            _phaseEndsAt = 0f;
+            EnterIdleWithCooldown(RandomRange(idleCooldownRange));
         }
+    }
+
+    void StartPlayerLook(float duration)
+    {
+        Transform target = _playerEye != null ? _playerEye : _fallbackCam;
+        if (target == null)
+        {
+            EnterIdleWithCooldown(RandomRange(idleCooldownRange));
+            return;
+        }
+        StartPhase(GazePhase.Player, target, duration);
+    }
+
+    void StartPeerLook(Transform peer, float duration)
+    {
+        if (peer == null)
+        {
+            EnterIdleWithCooldown(RandomRange(idleCooldownRange));
+            return;
+        }
+        StartPhase(GazePhase.Peer, peer, duration);
+    }
+
+    void StartPhase(GazePhase newPhase, Transform target, float duration)
+    {
+        _phase = newPhase;
+        _currentTarget = target;
+        _phaseStartTime = Time.time;
+        _phaseTime = 0f;
+        bool infinite = float.IsPositiveInfinity(duration);
+        _phaseDur = infinite ? float.PositiveInfinity : Mathf.Max(0f, duration);
+        _phaseEndsAt = infinite ? float.PositiveInfinity : _phaseStartTime + _phaseDur;
+        _cooldownEndsAt = 0f;
+    }
+
+    void EnsureForceLook()
+    {
+        Transform target = null;
+
+        if (_playerEye != null && IsWithinDistanceAndView(_playerEye.position, targetMaxDistance))
+        {
+            target = _playerEye;
+        }
+        else if (_fallbackCam != null)
+        {
+            target = _fallbackCam;
+        }
+
+        if (target == null)
+        {
+            forceLook = false;
+            EnterIdleWithCooldown(RandomRange(idleCooldownRange));
+            return;
+        }
+
+        bool alreadyForced = _phase == GazePhase.Player &&
+                             _currentTarget == target &&
+                             float.IsPositiveInfinity(_phaseDur);
+
+        if (!alreadyForced)
+        {
+            StartPhase(GazePhase.Player, target, float.PositiveInfinity);
+        }
+    }
+
+    void EnterIdleWithCooldown(float cooldown)
+    {
+        _phase = GazePhase.Idle;
+        _currentTarget = null;
+        _phaseTime = 0f;
+        _phaseDur = 0f;
+        _phaseStartTime = 0f;
+        _phaseEndsAt = 0f;
+        _cooldownEndsAt = Time.time + Mathf.Max(0f, cooldown);
+        ResetIKState();
+    }
+
+    float RandomRange(Vector2 range)
+    {
+        float min = Mathf.Min(range.x, range.y);
+        float max = Mathf.Max(range.x, range.y);
+        return Random.Range(min, max);
+    }
+
+    void UpdateShareEMA(float dt)
+    {
+        if (dt <= 0f) return;
+        float baseAlpha = Mathf.Clamp01(shareEmaAlpha);
+        if (baseAlpha <= 0f) return;
+
+        float alpha = 1f - Mathf.Pow(1f - baseAlpha, dt);
+        float sample = (_phase == GazePhase.Player) ? 1f : 0f;
+        _emaPlayerShare = Mathf.Lerp(_emaPlayerShare, sample, alpha);
     }
 
     bool IsPlayerAvailable()
@@ -525,7 +525,6 @@ public class LookAtCrowd : MonoBehaviour
         float d2 = (transform.position - worldPos).sqrMagnitude;
         if (d2 > maxDist * maxDist) return false;
 
-        // view cone via yaw/pitch clamp
         Vector3 headPos = _head.position;
         Vector3 dir = (worldPos - headPos).normalized;
 
@@ -541,33 +540,27 @@ public class LookAtCrowd : MonoBehaviour
         return Mathf.Abs(e.x) <= maxPitch && Mathf.Abs(e.y) <= maxYaw;
     }
 
-    // =================
-    // Per-frame driving
-    // =================
     void LateUpdate()
     {
         if (!_anim || !_head) return;
 
-        // Update _phaseTime for easing based on absolute timestamps
         if (_phase == GazePhase.Player || _phase == GazePhase.Peer)
         {
-            float remaining = Mathf.Max(0f, _phaseEndsAt - Time.time);
-            _phaseTime = Mathf.Clamp(_phaseDur - remaining, 0f, _phaseDur);
+            _phaseTime = Mathf.Max(0f, Time.time - _phaseStartTime);
+            if (!float.IsPositiveInfinity(_phaseDur))
+            {
+                _phaseTime = Mathf.Min(_phaseTime, _phaseDur);
+            }
         }
         else
         {
-            _phaseTime = 0f; // idle
+            _phaseTime = 0f;
         }
 
-        // If in idle cooldown, do nothing
         bool inIdleCooldown = (_phase == GazePhase.Idle) && (Time.time < _cooldownEndsAt);
         if (inIdleCooldown && !forceLook)
         {
-            _applyIK = false;
-            _ikW = 0f;
-            _aim = Vector3.zero;
-            _haveDesiredWorldDir = false;
-            _desiredWeight = 0f;
+            ResetIKState();
             return;
         }
 
@@ -586,10 +579,6 @@ public class LookAtCrowd : MonoBehaviour
             else if (_phase == GazePhase.Peer)
             {
                 useThis = _currentTarget;
-            }
-            else
-            {
-                useThis = null;
             }
         }
 
@@ -619,16 +608,22 @@ public class LookAtCrowd : MonoBehaviour
             float aimDist = Mathf.Max(0.5f, Vector3.Distance(headPos, desiredPos));
             _aim = headPos + newDir * aimDist;
 
-            float totalDur = Mathf.Max(0.01f, _phaseDur);
-            float tInto = Mathf.Clamp01((_phaseDur <= 0f) ? 1f : _phaseTime / totalDur);
+            float totalDur = float.IsPositiveInfinity(_phaseDur) ? Mathf.Max(_phaseTime, 0.01f) : Mathf.Max(0.01f, _phaseDur);
 
             float inF = 1f, outF = 1f;
             if (!forceLook && easeTime > 0f)
             {
-                inF = Mathf.Clamp01((_phaseTime) / easeTime);
-                outF = Mathf.Clamp01((totalDur - _phaseTime) / easeTime);
+                inF = Mathf.Clamp01(_phaseTime / easeTime);
+                if (float.IsPositiveInfinity(_phaseDur))
+                {
+                    outF = 1f;
+                }
+                else
+                {
+                    outF = Mathf.Clamp01((_phaseDur - _phaseTime) / easeTime);
+                }
             }
-            _ikW = (forceLook ? weight : (weight * Mathf.Min(inF, outF)));
+            _ikW = forceLook ? weight : (weight * Mathf.Min(inF, outF));
 
             _ikPos = _aim;
             _applyIK = _ikW > 0f;
@@ -639,12 +634,7 @@ public class LookAtCrowd : MonoBehaviour
         }
         else
         {
-            _applyIK = false;
-            _ikW = 0f;
-            _aim = Vector3.zero;
-
-            _haveDesiredWorldDir = false;
-            _desiredWeight = 0f;
+            ResetIKState();
         }
     }
 
@@ -673,14 +663,9 @@ public class LookAtCrowd : MonoBehaviour
 
             if (!applyAtEndOfFrame || !_anim || !_head) continue;
             ApplyHeadOverrideNow();
-
-            // IMPORTANT: do NOT modify _phaseTime here (avoids double-counting)
         }
     }
 
-    /// <summary>
-    /// Public hook to force-apply the cached head look now (call from MM OnUpdateGaze if needed).
-    /// </summary>
     public void ApplyHeadOverrideNow()
     {
         if (!_anim || !_head) return;
@@ -733,11 +718,7 @@ public class LookAtCrowd : MonoBehaviour
         forceLook = !forceLook;
         if (forceLook)
         {
-            _phase = GazePhase.Player;
-            _currentTarget = _playerEye != null ? _playerEye : _fallbackCam;
-            _phaseDur = Mathf.Max(1f, playerLookDurationRange.x);
-            _phaseTime = 0f;
-            _phaseEndsAt = Time.time + _phaseDur;
+            EnsureForceLook();
         }
     }
 
@@ -745,92 +726,66 @@ public class LookAtCrowd : MonoBehaviour
     void LookForTwoSeconds()
     {
         if (forceLook) return;
-        _phase = GazePhase.Player;
-        _currentTarget = _playerEye != null ? _playerEye : _fallbackCam;
-        _phaseDur = 2f;
-        _phaseTime = 0f;
-        _phaseEndsAt = Time.time + 2f;
+        Transform target = _playerEye != null ? _playerEye : _fallbackCam;
+        if (target == null) return;
+
+        StartPhase(GazePhase.Player, target, 2f);
     }
 
     IEnumerator StopLookingAtPlayerAfterCo(float cooldown)
     {
-        // Prevent forced look from re-asserting during the wait
         forceLook = false;
 
-        if (cooldown > 0f) yield return new WaitForSeconds(cooldown);
+        if (cooldown > 0f)
+        {
+            yield return new WaitForSeconds(cooldown);
+        }
 
-        // Only stop if we are actually looking at the player at that moment
         if (_phase == GazePhase.Player)
         {
-            // IMPORTANT: use default => applies Random(playerCooldownRange)
             BreakPlayerLook();
         }
 
         _scheduledStopCo = null;
     }
 
-    // =====================================================
-    // Eye-contact API — call from your player's gaze script
-    // =====================================================
-
-    /// <summary>
-    /// schedule a stop after 'cooldown' seconds.
-    /// If already scheduled, the previous one is replaced.
-    /// </summary>
     public void ScheduleStopLookingAtPlayer(float cooldown)
     {
         if (_scheduledStopCo != null) StopCoroutine(_scheduledStopCo);
         _scheduledStopCo = StartCoroutine(StopLookingAtPlayerAfterCo(cooldown));
+
+        if (_phase == GazePhase.Player)
+        {
+            float clamped = Mathf.Max(0f, cooldown);
+            _phaseEndsAt = Time.time + clamped;
+            if (_phaseStartTime <= 0f)
+            {
+                _phaseStartTime = Time.time;
+            }
+            _phaseDur = Mathf.Max(0f, _phaseEndsAt - _phaseStartTime);
+        }
     }
 
-    /// <summary>
-    /// Minimal notification: call this when the player's gaze raycast hits this character.
-    /// </summary>
     public void NotifyEyeContact()
     {
         TryFireEyeContactReactions();
     }
 
-    /// <summary>
-    /// Optional overload if you want to pass the player's gaze ray (not required).
-    /// </summary>
     public void NotifyEyeContact(Ray playerGazeRay)
     {
-        // you could add extra checks using the ray if desired
         TryFireEyeContactReactions();
     }
 
-    // =====================================================
-    // NEW: utility to break player look after extra negative
-    // =====================================================
     void BreakPlayerLook(float cooldown = -1f)
     {
-        if (cooldown < 0f)
-            cooldown = Random.Range(playerCooldownRange.x, playerCooldownRange.y);
-
-        // Switch out of player gaze and start an absolute cooldown window
-        _phase = GazePhase.Idle;
-        _currentTarget = null;
-
-        _phaseDur = 0f;
-        _phaseTime = 0f;
-        _phaseEndsAt = 0f;
-        _cooldownEndsAt = Time.time + Mathf.Max(0f, cooldown); // absolute cooldown gate
-
-        // Clear any ongoing IK application
-        _applyIK = false;
-        _ikW = 0f;
-        _aim = Vector3.zero;
-
-        _haveDesiredWorldDir = false;
-        _desiredWeight = 0f;
+        float useCooldown = cooldown >= 0f ? cooldown : RandomRange(playerCooldownRange);
+        EnterIdleWithCooldown(useCooldown);
     }
 
     void TryFireEyeContactReactions()
     {
         Debug.Log($"Eye contact received! Phase: {_phase}, tInto: {_phaseTime:0.00}/{_phaseDur:0.00}, dtSinceLast: {Time.time - _lastEyeContactTime:0.00}");
 
-        // Cooldown for reactions
         if (Time.time - _lastEyeContactTime < eyeContactCooldown)
         {
             Debug.Log("Eye contact skipped: reaction cooldown active");
@@ -843,7 +798,6 @@ public class LookAtCrowd : MonoBehaviour
             return;
         }
 
-        // Require we are into the look at least a bit
         if (_phaseTime < minTimeIntoLookToReact)
         {
             Debug.Log($"Eye contact skipped: too early in look ({_phaseTime:0.00}s)");
@@ -863,29 +817,38 @@ public class LookAtCrowd : MonoBehaviour
         Transform useThis = (_playerEye != null) ? _playerEye : _fallbackCam;
         if (useThis != null && IsWithinDistanceAndView(useThis.position, 60.0f))
         {
-            // Reactions by condition
             switch (condition)
             {
                 case ConditionType.Positive:
-                    OnEyeContactPositive?.Invoke(); // 100%
+                    OnEyeContactPositive?.Invoke();
                     if (Random.value < positiveExtraProbability)
                     {
-                        OnEyeContactPositiveExtra?.Invoke(); // extra hit
+                        OnEyeContactPositiveExtra?.Invoke();
                         ScheduleStopLookingAtPlayer(6.0f);
                     }
                     ScheduleStopLookingAtPlayer(4.0f);
                     break;
 
                 case ConditionType.Negative:
-                    OnEyeContactNegativeConstant?.Invoke(); // 100%
+                    OnEyeContactNegativeConstant?.Invoke();
                     if (Random.value < negativeExtraProbability)
                     {
-                        OnEyeContactNegativeExtra?.Invoke(); // extra hit
+                        OnEyeContactNegativeExtra?.Invoke();
                         ScheduleStopLookingAtPlayer(6.0f);
                     }
                     ScheduleStopLookingAtPlayer(4.0f);
                     break;
             }
         }
+    }
+
+    void ResetIKState()
+    {
+        _applyIK = false;
+        _ikW = 0f;
+        _aim = Vector3.zero;
+        _ikPos = Vector3.zero;
+        _haveDesiredWorldDir = false;
+        _desiredWeight = 0f;
     }
 }
